@@ -43,7 +43,7 @@ with open(dst, "w") as f:
     f.write("\n")
 PYEOF
 
-LOCALES="$(python3 -c "import json,sys; data=json.load(open(sys.argv[1])); print('\n'.join(l['locale'] for l in data['locales']))" "$LOCALES_FILE")"
+LOCALES="$(python3 -c "import json,sys; data=json.load(open(sys.argv[1])); print('\n'.join(data['locales']))" "$LOCALES_FILE")"
 
 while IFS= read -r locale; do
   if [ -z "$locale" ]; then
