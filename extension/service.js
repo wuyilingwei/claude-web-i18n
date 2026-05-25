@@ -10,11 +10,16 @@ const MESSAGE_HANDLERS = {
   "fetch-locales-manifest": fetchLocalesManifest,
   "get-i18n-resource": getI18nResource,
 };
+const logger = createLogger("service");
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   handleMessage(message)
     .then(sendResponse)
     .catch((error) => {
+      logger.error("message.handler.failed", {
+        type: typeof message?.type === "string" ? message.type : "unknown",
+        message: error instanceof Error ? error.message : String(error),
+      });
       sendResponse({
         ok: false,
         error: error instanceof Error ? error.message : String(error),
@@ -26,6 +31,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
 async function handleMessage(message) {
   if (!message || typeof message !== "object") {
+    logger.warn("message.invalid");
     return {
       ok: false,
       error: "Invalid message payload",
@@ -34,6 +40,9 @@ async function handleMessage(message) {
 
   const handler = MESSAGE_HANDLERS[message.type];
   if (!handler) {
+    logger.warn("message.unknown", {
+      type: String(message.type),
+    });
     return {
       ok: false,
       error: `Unknown message type: ${String(message.type)}`,
@@ -53,6 +62,11 @@ async function fetchLocalesManifest() {
   if (!data || !Array.isArray(data.locales)) {
     throw new Error("Remote locales manifest is invalid");
   }
+
+  logger.info("locales.manifest.fetched", {
+    version: typeof data.version === "string" ? data.version : "unknown",
+    localeCount: data.locales.filter(isString).length,
+  });
 
   return {
     ok: true,
@@ -84,7 +98,13 @@ async function getI18nResource(payload) {
   const cache = await caches.open(RESOURCE_CACHE_NAME);
   const cachedResponse = await cache.match(cacheKey);
   if (cachedResponse) {
-    return responseToPayload(cachedResponse);
+    logger.info("i18n.resource.cache-hit", {
+      locale,
+      kind,
+    });
+    return responseToPayload(cachedResponse, {
+      source: "cache",
+    });
   }
 
   const remoteUrl = buildRemoteI18nUrl(locale, kind);
@@ -100,9 +120,17 @@ async function getI18nResource(payload) {
   const responseToCache = createCacheableResponse(remoteResponse, body);
 
   await cache.put(cacheKey, responseToCache.clone());
-  await pruneOldCacheEntries(cache, locale, kind, resourceHash);
+  const prunedCount = await pruneOldCacheEntries(cache, locale, kind, resourceHash);
+  logger.info("i18n.resource.remote-fetched", {
+    locale,
+    kind,
+    status: remoteResponse.status,
+    prunedCount,
+  });
 
-  return responseToPayload(responseToCache);
+  return responseToPayload(responseToCache, {
+    source: "remote",
+  });
 }
 
 async function getVersionInfo(locale) {
@@ -129,9 +157,18 @@ async function getVersionInfo(locale) {
       [storageKey]: next,
     });
 
+    logger.info("version.updated", {
+      locale,
+      builtAt: next.builtAt || "unknown",
+    });
+
     return next;
   } catch (error) {
     if (cached && Array.isArray(cached.hash)) {
+      logger.warn("version.fetch.failed-using-cache", {
+        locale,
+        message: error instanceof Error ? error.message : String(error),
+      });
       return cached;
     }
 
@@ -163,6 +200,7 @@ function buildResourceCacheKey(locale, kind, hash) {
 async function pruneOldCacheEntries(cache, locale, kind, currentHash) {
   const keys = await cache.keys();
   const prefix = `https://cache.claude-i18n.local/${encodeURIComponent(locale)}/${kind}/`;
+  let deletedCount = 0;
 
   await Promise.all(
     keys.map((request) => {
@@ -170,12 +208,18 @@ async function pruneOldCacheEntries(cache, locale, kind, currentHash) {
         return Promise.resolve();
       }
 
-      return cache.delete(request);
+      return cache.delete(request).then((deleted) => {
+        if (deleted) {
+          deletedCount += 1;
+        }
+      });
     }),
   );
+
+  return deletedCount;
 }
 
-async function responseToPayload(response) {
+async function responseToPayload(response, meta = null) {
   const body = await response.text();
   return {
     ok: true,
@@ -183,6 +227,7 @@ async function responseToPayload(response) {
     statusText: response.statusText,
     headers: headersToObject(response.headers),
     body,
+    meta,
   };
 }
 
@@ -255,4 +300,44 @@ function headersToObject(headers) {
 
 function isString(value) {
   return typeof value === "string";
+}
+
+function createLogger(component) {
+  return {
+    info(event, detail) {
+      log("info", event, detail);
+    },
+    warn(event, detail) {
+      log("warn", event, detail);
+    },
+    error(event, detail) {
+      log("error", event, detail);
+    },
+  };
+
+  function log(level, event, detail) {
+    const message = `[claude-i18n][${component}] ${event}`;
+    const safeDetail = compactDetail(detail);
+    if (safeDetail) {
+      console[level](message, safeDetail);
+      return;
+    }
+
+    console[level](message);
+  }
+}
+
+function compactDetail(detail) {
+  if (!detail || typeof detail !== "object") {
+    return null;
+  }
+
+  const output = {};
+  for (const [key, value] of Object.entries(detail)) {
+    if (value !== undefined && value !== null && value !== "") {
+      output[key] = value;
+    }
+  }
+
+  return Object.keys(output).length > 0 ? output : null;
 }

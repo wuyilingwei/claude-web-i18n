@@ -53,6 +53,7 @@
   const SKIPPED_STATIC_METHODS = new Set(["isArray"]);
 
   const runtime = createRuntimeState();
+  const logger = createLogger("hook", recordLogEntry);
   const fetchRules = createFetchRules();
 
   install();
@@ -61,6 +62,10 @@
     installFetchInterceptor(fetchRules);
     installArrayPatches();
     scheduleLocalesRefresh();
+    logger.info("hook.installed", {
+      localeCount: runtime.extensionLocales.length,
+      manifestVersion: runtime.report.localesManifestVersion || "none",
+    });
   }
 
   function createRuntimeState() {
@@ -98,6 +103,7 @@
       i18nCacheHits: 0,
       mutationCount: 0,
       lastMutation: null,
+      logs: [],
       errors: [],
     };
   }
@@ -275,6 +281,10 @@
       runtime.report.extensionLocales = runtime.extensionLocales.slice();
       runtime.report.localesManifestVersion = nextVersion;
       runtime.report.localesManifestRefreshHits += 1;
+      logger.info("locales.refresh.updated", {
+        version: nextVersion || "unknown",
+        localeCount: nextLocales.length,
+      });
       return;
     }
 
@@ -306,6 +316,7 @@
         },
         beforeFetch() {
           runtime.report.i18nOverridesHits += 1;
+          logger.info("i18n.overrides.served");
           return {
             response: createJsonResponse("{}", 200),
           };
@@ -335,6 +346,12 @@
           }
 
           runtime.report.i18nCacheHits += 1;
+          logger.info("i18n.resource.served", {
+            locale: resource.locale,
+            kind: resource.kind,
+            source: payload.meta?.source || "unknown",
+            status: payload.status,
+          });
           return {
             response: createResponseFromPayload(payload),
           };
@@ -353,6 +370,9 @@
         },
         beforeFetch(context) {
           runtime.report.experienceLocaleRewriteHits += 1;
+          logger.info("experience.request.rewritten", {
+            locale: context.url.searchParams.get("locale") || "unknown",
+          });
           return {
             request: replaceUrl(context.input, context.init, buildExperienceUrl(context.url)),
           };
@@ -404,33 +424,42 @@
     const context = createFetchContext(fetchThis, args);
     const responseRules = [];
 
-    for (const rule of rules) {
-      if (!rule.matches(context)) {
-        continue;
+    try {
+      for (const rule of rules) {
+        if (!rule.matches(context)) {
+          continue;
+        }
+
+        if (typeof rule.afterFetch === "function") {
+          responseRules.push(rule);
+        }
+
+        if (typeof rule.beforeFetch !== "function") {
+          continue;
+        }
+
+        const outcome = await rule.beforeFetch(context);
+        if (outcome?.request) {
+          context.replaceRequest(outcome.request);
+        }
+        if (outcome?.response) {
+          return outcome.response;
+        }
       }
 
-      if (typeof rule.afterFetch === "function") {
-        responseRules.push(rule);
+      let response = await context.fetch();
+      for (const rule of responseRules) {
+        response = await rule.afterFetch(response, context);
       }
-
-      if (typeof rule.beforeFetch !== "function") {
-        continue;
-      }
-
-      const outcome = await rule.beforeFetch(context);
-      if (outcome?.request) {
-        context.replaceRequest(outcome.request);
-      }
-      if (outcome?.response) {
-        return outcome.response;
-      }
+      return response;
+    } catch (error) {
+      logger.error("fetch.rule.failed", {
+        request: describeRequest(context.url),
+        method: context.method,
+        message: stringifyError(error),
+      });
+      throw error;
     }
-
-    let response = await context.fetch();
-    for (const rule of responseRules) {
-      response = await rule.afterFetch(response, context);
-    }
-    return response;
   }
 
   function createFetchContext(fetchThis, args) {
@@ -519,6 +548,10 @@
     writeStoredProfileLocale(profileLocale);
     body.locale = ACCOUNT_PROFILE_FALLBACK_LOCALE;
     runtime.report.accountProfilePutHits += 1;
+    logger.info("account-profile.request.rewritten", {
+      method,
+      locale: profileLocale,
+    });
 
     return createAccountProfileRequestState(
       replaceRequestBody(input, init, JSON.stringify(body)),
@@ -551,6 +584,10 @@
       runtime.report.accountProfileGetHits += 1;
     }
     runtime.report.accountProfileResponseHits += 1;
+    logger.info("account-profile.response.rewritten", {
+      method: requestState.method,
+      locale: profileLocale,
+    });
 
     return replaceJsonResponse(response, body);
   }
@@ -578,6 +615,9 @@
     }
 
     runtime.report.bootstrapLocaleRewriteHits += 1;
+    logger.info("bootstrap.response.rewritten", {
+      locale: profileLocale,
+    });
     return replaceJsonResponse(response, body);
   }
 
@@ -883,9 +923,19 @@
       at: Date.now(),
       message,
     });
+    logger.error("runtime.error", {
+      message,
+    });
 
     if (runtime.report.errors.length > 20) {
       runtime.report.errors.shift();
+    }
+  }
+
+  function recordLogEntry(entry) {
+    runtime.report.logs.push(entry);
+    if (runtime.report.logs.length > 50) {
+      runtime.report.logs.shift();
     }
   }
 
@@ -899,5 +949,79 @@
 
   function isString(value) {
     return typeof value === "string";
+  }
+
+  function describeRequest(url) {
+    const resource = parseI18nResource(url);
+    if (resource) {
+      return `i18n:${resource.kind}`;
+    }
+
+    if (matchesSameOriginUrl(url, { pathnamePattern: PATH_PATTERNS.overridesI18n })) {
+      return "i18n:overrides";
+    }
+
+    if (matchesSameOriginUrl(url, { pathnamePattern: PATH_PATTERNS.experience })) {
+      return "experience";
+    }
+
+    if (matchesSameOriginUrl(url, { pathnamePattern: PATH_PATTERNS.bootstrapAppStart })) {
+      return "bootstrap";
+    }
+
+    if (matchesSameOriginUrl(url, { pathname: ACCOUNT_PROFILE_PATH })) {
+      return "account-profile";
+    }
+
+    return "other";
+  }
+
+  function createLogger(component, onRecord) {
+    return {
+      info(event, detail) {
+        log("info", event, detail);
+      },
+      error(event, detail) {
+        log("error", event, detail);
+      },
+    };
+
+    function log(level, event, detail) {
+      const message = `[claude-i18n][${component}] ${event}`;
+      const safeDetail = compactDetail(detail);
+      const entry = {
+        at: new Date().toISOString(),
+        level,
+        component,
+        event,
+        ...(safeDetail || {}),
+      };
+
+      if (typeof onRecord === "function") {
+        onRecord(entry);
+      }
+
+      if (safeDetail) {
+        console[level](message, safeDetail);
+        return;
+      }
+
+      console[level](message);
+    }
+  }
+
+  function compactDetail(detail) {
+    if (!detail || typeof detail !== "object") {
+      return null;
+    }
+
+    const output = {};
+    for (const [key, value] of Object.entries(detail)) {
+      if (value !== undefined && value !== null && value !== "") {
+        output[key] = value;
+      }
+    }
+
+    return Object.keys(output).length > 0 ? output : null;
   }
 })();
