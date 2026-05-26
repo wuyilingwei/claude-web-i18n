@@ -1,4 +1,5 @@
 dist/
+.overrides
 .remember
 .translation
 CLAUDE.md
