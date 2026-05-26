@@ -129,26 +129,39 @@
   }
 
   function parseExtensionRequest(data) {
-    if (!data || data.source !== PAGE_SOURCE || data.type !== EXTENSION_REQUEST_TYPE) {
+    const message = parseExtensionMessage(data);
+    if (!message || message.source !== PAGE_SOURCE || message.type !== EXTENSION_REQUEST_TYPE) {
       return null;
     }
 
     return {
-      requestId: data.requestId,
-      action: data.action,
-      payload: data.payload,
+      requestId: message.requestId,
+      action: message.action,
+      payload: message.payload,
     };
+  }
+
+  function parseExtensionMessage(data) {
+    if (typeof data === "string") {
+      try {
+        return JSON.parse(data);
+      } catch {
+        return null;
+      }
+    }
+
+    return data;
   }
 
   function postExtensionResponse(requestId, payload) {
     const pageWindow = getPageWindow();
     pageWindow.postMessage(
-      {
+      JSON.stringify({
         source: EXTENSION_SOURCE,
         type: EXTENSION_RESPONSE_TYPE,
         requestId,
         payloadJson: serializeExtensionPayload(payload),
-      },
+      }),
       pageWindow.location.origin,
     );
   }
@@ -1172,7 +1185,7 @@
             return;
           }
 
-          const data = event.data;
+          const data = parseExtensionMessage(event.data);
           if (
             !data ||
             data.source !== EXTENSION_SOURCE ||
@@ -1194,16 +1207,28 @@
 
         window.addEventListener("message", handleMessage);
         window.postMessage(
-          {
+          JSON.stringify({
             source: PAGE_SOURCE,
             type: EXTENSION_REQUEST_TYPE,
             requestId,
             action,
             payload,
-          },
+          }),
           window.location.origin,
         );
       });
+    }
+
+    function parseExtensionMessage(data) {
+      if (typeof data === "string") {
+        try {
+          return JSON.parse(data);
+        } catch {
+          return null;
+        }
+      }
+
+      return data;
     }
 
     function parseExtensionResponsePayload(data) {
