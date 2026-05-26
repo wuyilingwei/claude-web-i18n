@@ -147,10 +147,24 @@
         source: EXTENSION_SOURCE,
         type: EXTENSION_RESPONSE_TYPE,
         requestId,
-        payload,
+        payloadJson: serializeExtensionPayload(payload),
       },
       pageWindow.location.origin,
     );
+  }
+
+  function serializeExtensionPayload(payload) {
+    try {
+      return JSON.stringify(payload);
+    } catch (error) {
+      logger.error("bridge.response.serialize.failed", {
+        message: stringifyError(error),
+      });
+      return JSON.stringify({
+        ok: false,
+        error: `Failed to serialize response: ${stringifyError(error)}`,
+      });
+    }
   }
 
   async function handleMessage(message) {
@@ -1170,7 +1184,12 @@
 
           ORIGINAL.clearTimeout(timeout);
           window.removeEventListener("message", handleMessage);
-          resolve(data.payload);
+
+          try {
+            resolve(parseExtensionResponsePayload(data));
+          } catch (error) {
+            reject(error);
+          }
         }
 
         window.addEventListener("message", handleMessage);
@@ -1185,6 +1204,18 @@
           window.location.origin,
         );
       });
+    }
+
+    function parseExtensionResponsePayload(data) {
+      if (typeof data.payloadJson === "string") {
+        try {
+          return JSON.parse(data.payloadJson);
+        } catch (error) {
+          throw new Error(`Invalid extension response payload: ${stringifyError(error)}`);
+        }
+      }
+
+      return data.payload;
     }
 
     function hasArrayValue(value, expected) {
