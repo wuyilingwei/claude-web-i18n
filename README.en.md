@@ -25,12 +25,12 @@ After installation, a **中文（中国）** option appears in Claude Web's lang
 
 <div align="center">
 
-<img src="showcase-1.jpg" width="720" alt="Main page" />
+<img src="assets/showcase-1.jpg" width="720" alt="Main page" />
 
 <details>
 <summary>Click to view more screenshots</summary>
-<img src="showcase-2.jpg" width="720" alt="Extension page" />
-<img src="showcase-3.jpg" width="720" alt="Paid plan page" />
+<img src="assets/showcase-2.jpg" width="720" alt="Extension page" />
+<img src="assets/showcase-3.jpg" width="720" alt="Paid plan page" />
 </details>
 
 </div>
