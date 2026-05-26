@@ -57,7 +57,7 @@ Non-Chromium browser users can try [`userscript/claude-i18n.user.js`](userscript
 1. Install Tampermonkey in Firefox Desktop
 2. Open the Tampermonkey Dashboard and create a new script
 3. Replace the default template with the contents of [`userscript/claude-i18n.user.js`](userscript/claude-i18n.user.js), then save
-4. Open [claude.ai](https://claude.ai), click your username in the bottom-left → Language → **简体中文** ✓
+4. Open [claude.ai](https://claude.ai), click your username in the bottom-left → Language → **中文（中国）** ✓
 
 See [`userscript/README.md`](userscript/README.md) for details.
 
@@ -68,7 +68,7 @@ See [`userscript/README.md`](userscript/README.md) for details.
 3. Enable **Developer mode** in the top-right corner
 4. **Drag and drop** the downloaded `.crx` file into the browser window
 5. Click "Add extension" to confirm
-6. Open [claude.ai](https://claude.ai), click your username in the bottom-left → Language → **简体中文** ✓
+6. Open [claude.ai](https://claude.ai), click your username in the bottom-left → Language → **中文（中国）** ✓
 
 ### Option 4: Build from source
 
