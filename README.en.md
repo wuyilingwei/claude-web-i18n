@@ -8,7 +8,7 @@
 
 [简体中文](README.md) | [繁體中文](README.tw.md) | English
 
-[![Version](https://img.shields.io/badge/version-v1.1.0-orange?style=flat-square)](https://github.com/pectics/claude-web-i18n/releases)
+[![Version](https://img.shields.io/badge/version-v1.1.1-orange?style=flat-square)](https://github.com/pectics/claude-web-i18n/releases)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Chrome%20%7C%20Edge-brightgreen?style=flat-square)](#installation)
 [![Locale](https://img.shields.io/badge/supported-Simplified%20Chinese-red?style=flat-square)](#supported-languages)
