@@ -8,7 +8,7 @@
 
 [简体中文](README.md) | [繁體中文](README.tw.md) | English
 
-[![Version](https://img.shields.io/badge/version-v1.0.2-orange?style=flat-square)](https://github.com/pectics/claude-web-i18n/releases)
+[![Version](https://img.shields.io/badge/version-v1.1.0-orange?style=flat-square)](https://github.com/pectics/claude-web-i18n/releases)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Chrome%20%7C%20Edge-brightgreen?style=flat-square)](#installation)
 [![Locale](https://img.shields.io/badge/supported-Simplified%20Chinese-red?style=flat-square)](#supported-languages)
@@ -21,13 +21,17 @@
 
 Claude's official interface has never supported Simplified Chinese. **This extension fixes that.**
 
-After installation, a **简体中文** option appears in Claude Web's language menu. One click switches nearly 10,000 UI strings to Chinese — no proxy, no configuration, no waiting for Anthropic to get around to it.
+After installation, a **中文（中国）** option appears in Claude Web's language menu. One click switches more than 15,000 UI and Statsig strings to Chinese — no proxy, no configuration, no waiting for Anthropic to get around to it.
 
 <div align="center">
 
-<img src="showcase-1.png" width="720" alt="Before and after comparison" />
+<img src="showcase-1.jpg" width="720" alt="Main page" />
 
-<img src="showcase-2.png" width="720" alt="Fully translated Chinese interface" />
+<details>
+<summary>Click to view more screenshots</summary>
+<img src="showcase-2.jpg" width="720" alt="Extension page" />
+<img src="showcase-3.jpg" width="720" alt="Paid plan page" />
+</details>
 
 </div>
 
@@ -46,7 +50,7 @@ After installation, a **简体中文** option appears in Claude Web's language m
 
 ### Option 2: Download from Releases
 
-1. Go to the [Releases page](https://github.com/pectics/claude-web-i18n/releases) and download the latest `.crx` file
+1. Go to the [Releases page](https://github.com/Pectics/claude-i18n/releases) and download the latest `.crx` file
 2. Open Chrome / Edge and navigate to `chrome://extensions/`
 3. Enable **Developer mode** in the top-right corner
 4. **Drag and drop** the downloaded `.crx` file into the browser window
@@ -56,8 +60,8 @@ After installation, a **简体中文** option appears in Claude Web's language m
 ### Option 3: Build from source
 
 ```bash
-git clone https://github.com/pectics/claude-web-i18n.git
-cd claude-web-i18n
+git clone https://github.com/Pectics/claude-i18n.git
+cd claude-i18n
 ```
 
 Then in `chrome://extensions/`, enable **Developer mode**, click "Load unpacked", and select the project's `extension/` directory.
@@ -66,31 +70,46 @@ Then in `chrome://extensions/`, enable **Developer mode**, click "Load unpacked"
 
 ## How does it work?
 
-Claude's backend rejects `zh-CN` as a locale value — it returns a validation error if you try. So this extension doesn't touch the backend at all. Instead, it intercepts all i18n resource requests in the browser and serves Chinese content from a Vercel-hosted endpoint.
+Claude's backend still does not accept `zh-CN` as a real locale. This extension simulates `zh-CN` on the frontend, falls backend-only requests back to `en-US`, and then restores the extension locale in the browser.
 
 ```
-You click "简体中文"
+You click "Chinese"
         ↓
-Extension injects a custom menu item (visually matches the native dropdown)
+`hook.js` is injected at `document_start` in the `MAIN` world
         ↓
-Claude fires /i18n/*.json requests
+When Claude Web builds the official locale array, the extension appends remote locales from `locales.json`
         ↓
-Extension intercepts them at the page level (transparently)
+`PUT` / `GET /api/account_profile`, `bootstrap`, and `experience` requests fall back to `en-US` where needed
         ↓
-Returns 9,951 carefully translated Chinese strings
+`GET /i18n/*.json` and `/i18n/statsig/*.json` for extension locales are handed off to the extension backend
         ↓
-UI switches to Chinese — no page reload needed
+The backend checks local cache first, then uses `/version/{locale}.json` hashes to decide whether a refresh is needed
+        ↓
+Returns the zh-CN main pack and Statsig pack
+        ↓
+UI switches using Claude's own locale flow
 ```
 
-**Smart caching:** Language packs are cached locally in two layers (Cache Storage + chrome.storage.local), with version hash verification. After the first load, subsequent switches are nearly instant and generate zero network requests unless a new version is available.
+The current implementation has three layers:
+
+- `hook.js`: runs in the page's main world and handles Array proxying, `fetch` interception, and request rewriting for `account_profile`, `bootstrap`, `experience`, and `i18n`.
+- `script.js`: bridges messages between the page and the extension backend.
+- `service.js`: talks to the remote Vercel site, reads `/locales.json` and `/version/{locale}.json`, and maintains local caches.
+
+**Caching strategy:**
+
+- Extension locale list: read from cached `locales.json` in `localStorage` first, then lazy-load the remote manifest; replace the cache only when the version or content changes.
+- Language file version metadata: stored in `chrome.storage.local`, keyed by locale and backed by `/version/{locale}.json`.
+- Language file bodies: stored in Cache Storage; re-downloaded only when the hash changes.
+- `/i18n/*.overrides.json`: currently intercepted and returned as an empty `{}` object.
 
 ---
 
 ## Supported languages
 
-| Language | Strings | Status |
+| Language | String Count | Status |
 |----------|---------|--------|
-| Simplified Chinese (zh-CN) | 9,951 | ✅ Available |
+| Simplified Chinese (zh-CN) | 15,058 (15,012 main + 46 Statsig) | ✅ Available |
 | More languages | — | Contributions welcome |
 
 ---
@@ -99,7 +118,9 @@ UI switches to Chinese — no page reload needed
 
 ### Improving translations
 
-The translation file is at [`zh-CN/zh-CN.json`](zh-CN/zh-CN.json). The original English strings are in [`.original/en-US.json`](.original/en-US.json).
+The main UI translation file is [`zh-CN/zh-CN.json`](zh-CN/zh-CN.json). For `gated_messages` / Statsig-related copy, edit [`zh-CN/zh-CN.statsig.json`](zh-CN/zh-CN.statsig.json).
+
+The original main English strings are in [`.original/en-US.json`](.original/en-US.json).
 
 Edit the JSON file and open a PR. The structure is straightforward:
 
@@ -111,23 +132,40 @@ Edit the JSON file and open a PR. The structure is straightforward:
 
 ### Adding a new language
 
-1. Add a new locale entry to [`locales.json`](locales.json) (e.g. `{"locale": "zh-TW", "name": "繁體中文 (台灣)"}`)
-2. Create the locale directory and translation files (see `zh-CN/` for reference)
-3. Open a PR
+1. Append a locale string to the `locales` array in [`locales.json`](locales.json) (for example, `"zh-TW"`)
+2. Create the locale directory and both translation files:
+   `zh-TW/zh-TW.json`
+   `zh-TW/zh-TW.statsig.json`
+3. Run `./build.sh` and confirm it generates:
+   `dist/locales.json`
+   `dist/zh-TW/version.json`
+4. Open a PR
 
 ### Local build
 
 ```bash
 # Build language pack distribution files for Vercel
 ./build.sh
-
-# Package the browser extension zip
-./package-extension-zip.sh
 ```
+
+`build.sh` will automatically:
+
+- copy locale directories into `dist/`
+- generate `dist/locales.json`
+- generate `dist/<locale>/version.json` for each locale
+- compute separate hashes for the main pack and Statsig pack so the extension can do lazy cache updates
 
 ---
 
 ## Changelog
+
+### 1.1.0
+
+- Rebuilt the runtime pipeline into `hook.js`, `script.js`, and `service.js` for page interception, bridge messaging, and background caching
+- Fell backend-facing extension locale requests back to `en-US`, then restored the extension locale in `account_profile`, `bootstrap/app_start`, and related responses
+- Switched extension locale discovery to lazy-loaded remote `/locales.json`, cached in `localStorage`
+- Switched language pack updates to `/version/{locale}.json` hash validation, with metadata in `chrome.storage.local` and payloads in Cache Storage
+- Added compatibility handling for `experiences/claude_web`, `/i18n/*.overrides.json`, and the current request flow around extension locales
 
 ### 1.0.2
 
@@ -135,7 +173,6 @@ Edit the JSON file and open a PR. The structure is straightforward:
 - Moved the page hook to a more reliable runtime injection path so the i18n store can be captured again
 - Stubbed the new `gated-messages` request path for extension locales to avoid 404 HTML responses breaking switches
 - Added self-healing cache validation so stale invalid HTML payloads no longer poison the local language-pack cache
-
 ### 1.0.1
 
 - Completed the frontend reverse engineering needed to reach Claude Web's runtime locale override entry
