@@ -172,6 +172,13 @@ UI 按 Claude 自己的语言流程切换为中文
 
 ## 更新日志
 
+### 1.1.1
+
+- 将扩展 locale 的请求改写逻辑从按路径特判，重构为按协议形状匹配：统一检查 query 中的 `locale` 与请求 body 中的 `locale`
+- 通用 body 改写链路现已支持 `application/json`、`application/x-www-form-urlencoded`、`URLSearchParams` 与 `FormData`
+- same-origin JSON 响应会统一回写顶层 `locale` 与 `gated_messages.locale`，不再依赖 `account_profile`、`bootstrap`、`experiences` 等固定接口名
+- 将远端 `locales.json` 简化为纯字符串数组结构，并同步调整构建与扩展侧的 lazy cache 读取逻辑
+
 ### 1.1.0
 
 - 重构扩展运行链路为 `hook.js`、`script.js`、`service.js` 三层，分别负责页面拦截、桥接通信与后台缓存

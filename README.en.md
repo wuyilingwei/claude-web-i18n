@@ -172,6 +172,13 @@ Edit the JSON file and open a PR. The structure is straightforward:
 
 ## Changelog
 
+### 1.1.1
+
+- Replaced path-specific extension locale request rewrites with protocol-shape matching that checks `locale` in query parameters and request bodies
+- The generic body rewrite path now supports `application/json`, `application/x-www-form-urlencoded`, `URLSearchParams`, and `FormData`
+- Same-origin JSON responses now restore top-level `locale` and `gated_messages.locale` generically, without depending on fixed endpoint names such as `account_profile`, `bootstrap`, or `experiences`
+- Simplified remote `locales.json` to a plain string-array format and updated both the build step and the extension's lazy cache loading logic accordingly
+
 ### 1.1.0
 
 - Rebuilt the runtime pipeline into `hook.js`, `script.js`, and `service.js` for page interception, bridge messaging, and background caching
