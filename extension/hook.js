@@ -15,15 +15,12 @@
   const EXTENSION_SOURCE = "claude-i18n-extension";
   const EXTENSION_REQUEST_TYPE = "extension-request";
   const EXTENSION_RESPONSE_TYPE = "extension-response";
-  const ACCOUNT_PROFILE_PATH = "/api/account_profile";
   const ACCOUNT_PROFILE_FALLBACK_LOCALE = "en-US";
-  const ACCOUNT_PROFILE_RULE_STATE_KEY = "account-profile";
+  const GENERIC_LOCALE_RULE_STATE_KEY = "generic-locale";
   const LOCALES_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
   const EXTENSION_REQUEST_TIMEOUT_MS = 15 * 1000;
 
   const PATH_PATTERNS = {
-    experience: /^\/api\/organizations\/[^/]+\/experiences\/claude_web$/,
-    bootstrapAppStart: /^\/edge-api\/bootstrap\/[^/]+\/app_start$/,
     baseI18nResource: /^\/i18n\/([^/]+)\.json$/,
     statsigI18nResource: /^\/i18n\/statsig\/([^/]+)\.json$/,
     overridesI18n: /^\/i18n\/[^/]+\.overrides\.json$/,
@@ -93,11 +90,10 @@
       staticMethodsSkipped: [],
       localesManifestRefreshHits: 0,
       localesManifestRefreshErrors: 0,
-      accountProfilePutHits: 0,
-      accountProfileGetHits: 0,
-      accountProfileResponseHits: 0,
-      experienceLocaleRewriteHits: 0,
-      bootstrapLocaleRewriteHits: 0,
+      requestLocaleRewriteHits: 0,
+      queryLocaleRewriteHits: 0,
+      bodyLocaleRewriteHits: 0,
+      responseLocaleRewriteHits: 0,
       i18nOverridesHits: 0,
       i18nRedirectHits: 0,
       i18nCacheHits: 0,
@@ -358,57 +354,41 @@
         },
       },
       {
-        name: "experience-locale-fallback",
+        name: "generic-locale-transport",
         matches(context) {
-          return (
-            context.isGetRequest() &&
-            matchesSameOriginUrl(context.url, {
-              pathnamePattern: PATH_PATTERNS.experience,
-            }) &&
-            isExtensionLocale(context.url.searchParams.get("locale"))
-          );
-        },
-        beforeFetch(context) {
-          runtime.report.experienceLocaleRewriteHits += 1;
-          logger.info("experience.request.rewritten", {
-            locale: context.url.searchParams.get("locale") || "unknown",
-          });
-          return {
-            request: replaceUrl(context.input, context.init, buildExperienceUrl(context.url)),
-          };
-        },
-      },
-      {
-        name: "bootstrap-locale-response",
-        matches(context) {
-          return (
-            context.isGetRequest() &&
-            matchesSameOriginUrl(context.url, {
-              pathnamePattern: PATH_PATTERNS.bootstrapAppStart,
-            })
-          );
-        },
-        async afterFetch(response) {
-          return rewriteBootstrapResponse(response);
-        },
-      },
-      {
-        name: "account-profile-locale",
-        matches(context) {
-          return matchesSameOriginUrl(context.url, {
-            pathname: ACCOUNT_PROFILE_PATH,
-          });
+          return isSameOriginApplicationRequest(context.url);
         },
         async beforeFetch(context) {
-          const requestState = await prepareAccountProfileRequest(context.input, context.init);
-          context.setRuleState(ACCOUNT_PROFILE_RULE_STATE_KEY, requestState);
-          context.replaceRequest(requestState.request);
+          const requestState = await prepareLocaleAwareRequest(context.input, context.init);
+          context.setRuleState(GENERIC_LOCALE_RULE_STATE_KEY, requestState);
+          if (requestState.changed) {
+            context.replaceRequest(requestState.request);
+          }
+
+          if (requestState.cachedLocale) {
+            writeStoredProfileLocale(requestState.cachedLocale);
+          } else if (requestState.sawLocaleParameter) {
+            clearStoredProfileLocale();
+          }
+
+          if (requestState.queryChanged) {
+            runtime.report.queryLocaleRewriteHits += 1;
+          }
+          if (requestState.bodyChanged) {
+            runtime.report.bodyLocaleRewriteHits += 1;
+          }
+          if (requestState.changed) {
+            runtime.report.requestLocaleRewriteHits += 1;
+            logger.info("locale.request.rewritten", {
+              method: requestState.method,
+              queryChanged: requestState.queryChanged,
+              bodyChanged: requestState.bodyChanged,
+              locale: requestState.cachedLocale || "cleared",
+            });
+          }
         },
-        async afterFetch(response, context) {
-          return rewriteAccountProfileResponse(
-            response,
-            context.getRuleState(ACCOUNT_PROFILE_RULE_STATE_KEY),
-          );
+        async afterFetch(response) {
+          return rewriteLocaleAwareJsonResponse(response);
         },
       },
     ];
@@ -510,89 +490,59 @@
     return init === undefined ? [input] : [input, init];
   }
 
-  async function prepareAccountProfileRequest(input, init) {
-    const method = getRequestMethod(input, init);
-    const originalRequest = {
+  async function prepareLocaleAwareRequest(input, init) {
+    const request = {
       input,
       init,
     };
-    if (method === "GET") {
-      return createAccountProfileRequestState(originalRequest, method, readStoredProfileLocale());
+    const method = getRequestMethod(input, init);
+    let nextRequest = request;
+    let cachedLocale = null;
+    let sawLocaleParameter = false;
+    let queryChanged = false;
+    let bodyChanged = false;
+
+    const queryRewrite = rewriteLocaleInUrl(toUrl(input));
+    if (queryRewrite.sawLocaleParameter) {
+      sawLocaleParameter = true;
+    }
+    if (queryRewrite.cachedLocale) {
+      cachedLocale = queryRewrite.cachedLocale;
+    }
+    if (queryRewrite.changed) {
+      nextRequest = replaceUrl(nextRequest.input, nextRequest.init, queryRewrite.url);
+      queryChanged = true;
     }
 
-    if (method !== "PUT") {
-      return createAccountProfileRequestState(originalRequest, method, null);
+    const bodyRewrite = await rewriteLocaleInRequestBody(nextRequest.input, nextRequest.init);
+    if (bodyRewrite.sawLocaleParameter) {
+      sawLocaleParameter = true;
+    }
+    if (bodyRewrite.cachedLocale) {
+      cachedLocale = bodyRewrite.cachedLocale;
+    }
+    if (bodyRewrite.changed) {
+      nextRequest = replaceRequestBody(
+        nextRequest.input,
+        nextRequest.init,
+        bodyRewrite.body,
+        bodyRewrite.replaceOptions,
+      );
+      bodyChanged = true;
     }
 
-    const bodyText = await readRequestBodyText(input, init);
-    if (!bodyText) {
-      clearStoredProfileLocale();
-      return createAccountProfileRequestState(originalRequest, method, null);
-    }
-
-    const body = parseJsonObject(bodyText);
-    if (!body) {
-      clearStoredProfileLocale();
-      return createAccountProfileRequestState(originalRequest, method, null);
-    }
-
-    if (!isExtensionLocale(body.locale)) {
-      if (typeof body.locale === "string") {
-        clearStoredProfileLocale();
-      }
-
-      return createAccountProfileRequestState(originalRequest, method, null);
-    }
-
-    const profileLocale = body.locale;
-    writeStoredProfileLocale(profileLocale);
-    body.locale = ACCOUNT_PROFILE_FALLBACK_LOCALE;
-    runtime.report.accountProfilePutHits += 1;
-    logger.info("account-profile.request.rewritten", {
-      method,
-      locale: profileLocale,
-    });
-
-    return createAccountProfileRequestState(
-      replaceRequestBody(input, init, JSON.stringify(body)),
-      method,
-      profileLocale,
-    );
-  }
-
-  function createAccountProfileRequestState(request, method, profileLocale) {
     return {
-      request,
+      request: nextRequest,
       method,
-      profileLocale,
+      cachedLocale,
+      changed: queryChanged || bodyChanged,
+      queryChanged,
+      bodyChanged,
+      sawLocaleParameter,
     };
   }
 
-  async function rewriteAccountProfileResponse(response, requestState) {
-    const profileLocale = requestState?.profileLocale;
-    if (!isExtensionLocale(profileLocale)) {
-      return response;
-    }
-
-    const body = await readJsonObjectResponse(response);
-    if (!body) {
-      return response;
-    }
-
-    body.locale = profileLocale;
-    if (requestState.method === "GET") {
-      runtime.report.accountProfileGetHits += 1;
-    }
-    runtime.report.accountProfileResponseHits += 1;
-    logger.info("account-profile.response.rewritten", {
-      method: requestState.method,
-      locale: profileLocale,
-    });
-
-    return replaceJsonResponse(response, body);
-  }
-
-  async function rewriteBootstrapResponse(response) {
+  async function rewriteLocaleAwareJsonResponse(response) {
     const profileLocale = readStoredProfileLocale();
     if (!isExtensionLocale(profileLocale)) {
       return response;
@@ -603,21 +553,32 @@
       return response;
     }
 
-    body.locale = profileLocale;
+    let changed = false;
+    if (hasOwn(body, "locale") && isString(body.locale)) {
+      body.locale = profileLocale;
+      changed = true;
+    }
 
     if (
       body.gated_messages &&
       typeof body.gated_messages === "object" &&
-      !ORIGINAL.isArray(body.gated_messages)
+      !ORIGINAL.isArray(body.gated_messages) &&
+      hasOwn(body.gated_messages, "locale") &&
+      isString(body.gated_messages.locale)
     ) {
       body.gated_messages.locale = profileLocale;
-      // Leave gated_messages.messages untouched. Statsig payloads can vary per user.
+      changed = true;
     }
 
-    runtime.report.bootstrapLocaleRewriteHits += 1;
-    logger.info("bootstrap.response.rewritten", {
+    if (!changed) {
+      return response;
+    }
+
+    runtime.report.responseLocaleRewriteHits += 1;
+    logger.info("locale.response.rewritten", {
       locale: profileLocale,
     });
+
     return replaceJsonResponse(response, body);
   }
 
@@ -745,6 +706,10 @@
     return true;
   }
 
+  function isSameOriginApplicationRequest(url) {
+    return url.origin === window.location.origin && !isI18nTransportUrl(url);
+  }
+
   function toUrl(input) {
     if (input instanceof URL) {
       return input;
@@ -781,23 +746,56 @@
     return "";
   }
 
-  function replaceRequestBody(input, init, bodyText) {
+  function replaceRequestBody(input, init, body, options = {}) {
     if (input instanceof Request) {
-      return {
-        input: new Request(input, {
-          body: bodyText,
-        }),
-        init,
+      const requestInit = {
+        body,
       };
+      if (options.headers) {
+        requestInit.headers = options.headers;
+      }
+
+      return {
+        input: new Request(input, requestInit),
+        init: stripRequestOverrideInit(init, {
+          stripBody: true,
+          stripHeaders: Boolean(options.headers),
+        }),
+      };
+    }
+
+    const nextInit = {
+      ...(init || {}),
+      body,
+    };
+
+    if (options.headers) {
+      nextInit.headers = options.headers;
     }
 
     return {
       input,
-      init: {
-        ...(init || {}),
-        body: bodyText,
-      },
+      init: nextInit,
     };
+  }
+
+  function stripRequestOverrideInit(init, options) {
+    if (!init) {
+      return undefined;
+    }
+
+    const nextInit = {
+      ...init,
+    };
+
+    if (options.stripBody) {
+      delete nextInit.body;
+    }
+    if (options.stripHeaders) {
+      delete nextInit.headers;
+    }
+
+    return Object.keys(nextInit).length > 0 ? nextInit : undefined;
   }
 
   function replaceUrl(input, init, url) {
@@ -857,12 +855,6 @@
     return null;
   }
 
-  function buildExperienceUrl(url) {
-    const nextUrl = new URL(url.href);
-    nextUrl.searchParams.set("locale", ACCOUNT_PROFILE_FALLBACK_LOCALE);
-    return nextUrl;
-  }
-
   function createJsonResponse(bodyText, status) {
     return new Response(bodyText, {
       status,
@@ -918,6 +910,268 @@
     }
   }
 
+  function rewriteLocaleInUrl(url) {
+    const locale = url.searchParams.get("locale");
+    if (!isString(locale)) {
+      return {
+        changed: false,
+        sawLocaleParameter: false,
+        cachedLocale: null,
+        url,
+      };
+    }
+
+    if (!isExtensionLocale(locale)) {
+      return {
+        changed: false,
+        sawLocaleParameter: true,
+        cachedLocale: null,
+        url,
+      };
+    }
+
+    const nextUrl = new URL(url.href);
+    nextUrl.searchParams.set("locale", ACCOUNT_PROFILE_FALLBACK_LOCALE);
+    return {
+      changed: true,
+      sawLocaleParameter: true,
+      cachedLocale: locale,
+      url: nextUrl,
+    };
+  }
+
+  async function rewriteLocaleInRequestBody(input, init) {
+    const sourceHeaders = getRequestHeaders(input, init);
+    const initBodyRewrite = await rewriteLocaleInProvidedBody(
+      init?.body,
+      getRequestContentType(input, init),
+      sourceHeaders,
+    );
+    if (initBodyRewrite) {
+      return initBodyRewrite;
+    }
+
+    if (!(input instanceof Request)) {
+      return createNoBodyRewriteResult();
+    }
+
+    const contentType = input.headers.get("content-type") || "";
+    if (!isSupportedLocaleBodyContentType(contentType)) {
+      return createNoBodyRewriteResult();
+    }
+
+    const text = await input.clone().text();
+    if (!text) {
+      return createNoBodyRewriteResult();
+    }
+
+    return rewriteLocaleInTextBody(text, contentType, sourceHeaders);
+  }
+
+  async function rewriteLocaleInProvidedBody(body, contentType, sourceHeaders) {
+    if (body === undefined || body === null) {
+      return null;
+    }
+
+    if (body instanceof URLSearchParams) {
+      return rewriteLocaleInSearchParams(new URLSearchParams(body.toString()), {
+        replaceOptions: {
+          headers: ensureContentTypeHeader(
+            sourceHeaders,
+            contentType || "application/x-www-form-urlencoded;charset=UTF-8",
+          ),
+        },
+      });
+    }
+
+    if (body instanceof FormData) {
+      return rewriteLocaleInFormData(body, sourceHeaders);
+    }
+
+    if (typeof body === "string") {
+      return rewriteLocaleInTextBody(body, contentType, sourceHeaders);
+    }
+
+    return createNoBodyRewriteResult();
+  }
+
+  function rewriteLocaleInTextBody(text, contentType, sourceHeaders) {
+    if (looksLikeJsonBody(text, contentType)) {
+      const parsed = parseJsonObject(text);
+      if (!parsed || !hasOwn(parsed, "locale") || !isString(parsed.locale)) {
+        return createNoBodyRewriteResult();
+      }
+
+      const originalLocale = parsed.locale;
+      if (!isExtensionLocale(parsed.locale)) {
+        return {
+          changed: false,
+          sawLocaleParameter: true,
+          cachedLocale: null,
+          body: text,
+          replaceOptions: null,
+        };
+      }
+
+      parsed.locale = ACCOUNT_PROFILE_FALLBACK_LOCALE;
+      return {
+        changed: true,
+        sawLocaleParameter: true,
+        cachedLocale: originalLocale,
+        body: JSON.stringify(parsed),
+        replaceOptions: {
+          headers: ensureContentTypeHeader(sourceHeaders, contentType || "application/json"),
+        },
+      };
+    }
+
+    if (looksLikeFormUrlEncodedBody(text, contentType)) {
+      return rewriteLocaleInSearchParams(new URLSearchParams(text), {
+        serializeAsString: true,
+        replaceOptions: {
+          headers: ensureContentTypeHeader(
+            sourceHeaders,
+            contentType || "application/x-www-form-urlencoded;charset=UTF-8",
+          ),
+        },
+      });
+    }
+
+    return createNoBodyRewriteResult();
+  }
+
+  function rewriteLocaleInSearchParams(searchParams, options = {}) {
+    if (!searchParams.has("locale")) {
+      return createNoBodyRewriteResult();
+    }
+
+    const locale = searchParams.get("locale");
+    if (!isString(locale)) {
+      return createNoBodyRewriteResult();
+    }
+
+    if (!isExtensionLocale(locale)) {
+      return {
+        changed: false,
+        sawLocaleParameter: true,
+        cachedLocale: null,
+        body: options.serializeAsString ? searchParams.toString() : searchParams,
+        replaceOptions: options.replaceOptions || null,
+      };
+    }
+
+    searchParams.set("locale", ACCOUNT_PROFILE_FALLBACK_LOCALE);
+    return {
+      changed: true,
+      sawLocaleParameter: true,
+      cachedLocale: locale,
+      body: options.serializeAsString ? searchParams.toString() : searchParams,
+      replaceOptions: options.replaceOptions || null,
+    };
+  }
+
+  function rewriteLocaleInFormData(formData, sourceHeaders) {
+    if (!formData.has("locale")) {
+      return createNoBodyRewriteResult();
+    }
+
+    const locale = formData.get("locale");
+    if (!isString(locale)) {
+      return createNoBodyRewriteResult();
+    }
+
+    if (!isExtensionLocale(locale)) {
+      return {
+        changed: false,
+        sawLocaleParameter: true,
+        cachedLocale: null,
+        body: formData,
+        replaceOptions: null,
+      };
+    }
+
+    const nextFormData = new FormData();
+    for (const [key, value] of formData.entries()) {
+      nextFormData.append(key, value);
+    }
+    nextFormData.set("locale", ACCOUNT_PROFILE_FALLBACK_LOCALE);
+
+    return {
+      changed: true,
+      sawLocaleParameter: true,
+      cachedLocale: locale,
+      body: nextFormData,
+      replaceOptions: {
+        headers: ensureContentTypeHeader(sourceHeaders, null),
+      },
+    };
+  }
+
+  function createNoBodyRewriteResult() {
+    return {
+      changed: false,
+      sawLocaleParameter: false,
+      cachedLocale: null,
+      body: null,
+      replaceOptions: null,
+    };
+  }
+
+  function getRequestContentType(input, init) {
+    const headers = getRequestHeaders(input, init);
+    return headers.get("content-type") || "";
+  }
+
+  function getRequestHeaders(input, init) {
+    return new Headers(init?.headers || (input instanceof Request ? input.headers : undefined));
+  }
+
+  function ensureContentTypeHeader(sourceHeaders, contentType) {
+    const headers = new Headers(sourceHeaders || undefined);
+    if (contentType === null) {
+      headers.delete("content-type");
+      return headers;
+    }
+
+    if (!headers.has("content-type")) {
+      headers.set("content-type", contentType);
+    }
+    return headers;
+  }
+
+  function looksLikeJsonBody(text, contentType) {
+    const trimmed = text.trim();
+    if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) {
+      return false;
+    }
+
+    return isJsonContentType(contentType) || contentType === "";
+  }
+
+  function looksLikeFormUrlEncodedBody(text, contentType) {
+    if (isFormUrlEncodedContentType(contentType)) {
+      return true;
+    }
+
+    return contentType === "" && text.includes("=") && !text.trim().startsWith("{");
+  }
+
+  function isSupportedLocaleBodyContentType(contentType) {
+    return isJsonContentType(contentType) || isFormUrlEncodedContentType(contentType);
+  }
+
+  function isJsonContentType(contentType) {
+    return /(^|\/|\+)(json)(;|$)/i.test(contentType);
+  }
+
+  function isFormUrlEncodedContentType(contentType) {
+    return /^application\/x-www-form-urlencoded(?:;|$)/i.test(contentType);
+  }
+
+  function isI18nTransportUrl(url) {
+    return parseI18nResource(url) !== null || PATH_PATTERNS.overridesI18n.test(url.pathname);
+  }
+
   function pushError(message) {
     runtime.report.errors.push({
       at: Date.now(),
@@ -951,6 +1205,10 @@
     return typeof value === "string";
   }
 
+  function hasOwn(value, key) {
+    return Object.prototype.hasOwnProperty.call(value, key);
+  }
+
   function describeRequest(url) {
     const resource = parseI18nResource(url);
     if (resource) {
@@ -961,16 +1219,8 @@
       return "i18n:overrides";
     }
 
-    if (matchesSameOriginUrl(url, { pathnamePattern: PATH_PATTERNS.experience })) {
-      return "experience";
-    }
-
-    if (matchesSameOriginUrl(url, { pathnamePattern: PATH_PATTERNS.bootstrapAppStart })) {
-      return "bootstrap";
-    }
-
-    if (matchesSameOriginUrl(url, { pathname: ACCOUNT_PROFILE_PATH })) {
-      return "account-profile";
+    if (isSameOriginApplicationRequest(url)) {
+      return "same-origin-json";
     }
 
     return "other";
