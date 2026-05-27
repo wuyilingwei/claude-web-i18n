@@ -104,7 +104,9 @@ export function extractBacktickSegments(text) {
 }
 
 export function extractUrls(text) {
-  return text.match(/https?:\/\/[^\s<>()]+/g) || [];
+  return (text.match(/https?:\/\/[^\s<>()]+/g) || []).map((url) =>
+    url.replace(/[.,!?;:)\]}>"'`。，！？；：）】｝〉》」』]+$/gu, ''),
+  );
 }
 
 export function extractEmails(text) {
