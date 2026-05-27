@@ -16,8 +16,8 @@ concurrency:
 
 env:
   BRANCH_PREFIX: bot/update-original-locales-
-  MAIN_SOURCE_URL: https://claude.ai/i18n/en-US.json
-  STATSIG_SOURCE_URL: https://claude.ai/i18n/statsig/en-US.json
+  CONFIG_PATH: .original/upstream-locales.json
+  PENDING_DIR: .pending/original-locale-update
   FETCH_MAX_ATTEMPTS: "5"
   FETCH_INITIAL_BACKOFF_SECONDS: "5"
   FETCH_BACKOFF_MULTIPLIER: "2"
@@ -51,14 +51,19 @@ jobs:
 
           tmp_dir="$(mktemp -d)"
           trap 'rm -rf "$tmp_dir"' EXIT
+          fetch_summary="$tmp_dir/fetch-summary.json"
+          compare_summary="$tmp_dir/compare-summary.json"
+          diff_summary="$tmp_dir/diff-summary.json"
 
-          if python3 - "$MAIN_SOURCE_URL" "$tmp_dir/en-US.json" "$STATSIG_SOURCE_URL" "$tmp_dir/en-US.statsig.json" <<'PY'
+          if python3 - "$CONFIG_PATH" "$tmp_dir" "$fetch_summary" <<'PY'
           import sys
+          import json
           import os
           import random
           import time
           from curl_cffi import requests
 
+          config_path, tmp_dir, summary_path = sys.argv[1:4]
           RETRYABLE_STATUS_CODES = {403, 429, 500, 502, 503, 504}
           BLOCKING_STATUS_CODES = {403, 429}
           MAX_ATTEMPTS = int(os.environ.get("FETCH_MAX_ATTEMPTS", "5"))
@@ -67,16 +72,12 @@ jobs:
           JITTER_SECONDS = float(os.environ.get("FETCH_JITTER_SECONDS", "1"))
           SKIP_EXIT_CODE = 42
 
-          headers = {
-              "accept": "application/json,text/plain,*/*",
-              "accept-language": "en-US,en;q=0.9",
-              "referer": "https://claude.ai/",
-          }
+          with open(config_path, "r", encoding="utf-8") as file:
+              config = json.load(file)
 
-          sources = [
-              (sys.argv[1], sys.argv[2]),
-              (sys.argv[3], sys.argv[4]),
-          ]
+          locales = config.get("locales")
+          if not isinstance(locales, list) or not locales:
+              raise SystemExit(f"{config_path}: locales must be a non-empty array")
 
           def backoff_seconds(attempt):
               base = INITIAL_BACKOFF_SECONDS * (BACKOFF_MULTIPLIER ** max(attempt - 1, 0))
@@ -91,7 +92,18 @@ jobs:
               text = " ".join(text.split())
               return text[:300]
 
-          for url, output in sources:
+          class LocaleFetchError(Exception):
+              def __init__(self, message, preview=""):
+                  super().__init__(message)
+                  self.preview = preview
+
+          def fetch_json(url, accept_language, is_base):
+              headers = {
+                  "accept": "application/json,text/plain,*/*",
+                  "accept-language": accept_language,
+                  "referer": "https://claude.ai/",
+              }
+
               last_response = None
               last_error = None
 
@@ -109,11 +121,9 @@ jobs:
                           content = response.content
                           if not content.lstrip().startswith((b"{", b"[")):
                               raise SystemExit(f"Fetched response from {url} does not look like JSON.")
+                          return content
 
-                          with open(output, "wb") as file:
-                              file.write(content)
-                          break
-
+                      preview = body_preview(response)
                       if response.status_code in RETRYABLE_STATUS_CODES and attempt < MAX_ATTEMPTS:
                           delay = backoff_seconds(attempt)
                           print(
@@ -123,8 +133,7 @@ jobs:
                           time.sleep(delay)
                           continue
 
-                      if response.status_code in BLOCKING_STATUS_CODES:
-                          preview = body_preview(response)
+                      if response.status_code in BLOCKING_STATUS_CODES and is_base:
                           print(
                               f"::warning::Skipping upstream locale refresh because {url} still returned "
                               f"HTTP {response.status_code} after {MAX_ATTEMPTS} attempts."
@@ -133,8 +142,13 @@ jobs:
                               print(f"::warning::Response preview: {preview}")
                           raise SystemExit(SKIP_EXIT_CODE)
 
-                      response.raise_for_status()
+                      raise LocaleFetchError(
+                          f"{url} returned HTTP {response.status_code} after {MAX_ATTEMPTS} attempts.",
+                          preview,
+                      )
                   except SystemExit:
+                      raise
+                  except LocaleFetchError:
                       raise
                   except Exception as error:
                       last_error = error
@@ -146,14 +160,76 @@ jobs:
                           )
                           time.sleep(delay)
                           continue
-                      raise
+                      raise LocaleFetchError(
+                          f"{url} failed after {MAX_ATTEMPTS} attempts: {error}",
+                      )
 
-              else:
-                  if last_response is not None:
-                      last_response.raise_for_status()
-                  if last_error is not None:
-                      raise last_error
-                  raise SystemExit(f"Failed to fetch {url} for an unknown reason.")
+              if last_response is not None:
+                  raise LocaleFetchError(
+                      f"{url} returned HTTP {last_response.status_code} after {MAX_ATTEMPTS} attempts.",
+                      body_preview(last_response),
+                  )
+              if last_error is not None:
+                  raise LocaleFetchError(f"{url} failed after {MAX_ATTEMPTS} attempts: {last_error}")
+              raise LocaleFetchError(f"Failed to fetch {url} for an unknown reason.")
+
+          successful_locales = []
+          failed_locales = []
+          warnings = []
+          base_locale = locales[0]
+
+          for index, locale in enumerate(locales):
+              is_base = index == 0
+              accept_language = f"{locale},{base_locale};q=0.9,en;q=0.8"
+              outputs = [
+                  ("main", f"https://claude.ai/i18n/{locale}.json", os.path.join(tmp_dir, f"{locale}.json")),
+                  ("statsig", f"https://claude.ai/i18n/statsig/{locale}.json", os.path.join(tmp_dir, f"{locale}.statsig.json")),
+              ]
+              locale_failed = False
+              written_paths = []
+
+              for kind, url, output in outputs:
+                  try:
+                      content = fetch_json(url, accept_language, is_base)
+                      with open(output, "wb") as file:
+                          file.write(content)
+                      written_paths.append(output)
+                  except SystemExit:
+                      raise
+                  except LocaleFetchError as error:
+                      if is_base:
+                          raise SystemExit(str(error))
+
+                      locale_failed = True
+                      message = f"{locale} {kind} fetch failed: {error}"
+                      warnings.append(message if not error.preview else f"{message} Response preview: {error.preview}")
+                      for path in written_paths:
+                          try:
+                              os.remove(path)
+                          except FileNotFoundError:
+                              pass
+                      failed_locales.append(locale)
+                      print(f"::warning::{message}")
+                      if error.preview:
+                          print(f"::warning::Response preview: {error.preview}")
+                      break
+
+              if not locale_failed:
+                  successful_locales.append(locale)
+
+          with open(summary_path, "w", encoding="utf-8") as file:
+              json.dump(
+                  {
+                      "cachedLocales": locales,
+                      "baseLocale": base_locale,
+                      "successfulLocales": successful_locales,
+                      "failedLocales": failed_locales,
+                      "warnings": warnings,
+                  },
+                  file,
+                  ensure_ascii=False,
+                  indent=2,
+              )
           PY
           then
             :
@@ -168,20 +244,205 @@ jobs:
             exit "$status"
           fi
 
-          if cmp --silent "$tmp_dir/en-US.json" .original/en-US.json \
-            && cmp --silent "$tmp_dir/en-US.statsig.json" .original/en-US.statsig.json; then
+          python3 - "$CONFIG_PATH" "$tmp_dir" "$fetch_summary" "$compare_summary" <<'PY'
+          import json
+          import os
+          import sys
+
+          config_path, tmp_dir, fetch_summary_path, compare_summary_path = sys.argv[1:5]
+
+          with open(config_path, "r", encoding="utf-8") as file:
+              config = json.load(file)
+          with open(fetch_summary_path, "r", encoding="utf-8") as file:
+              summary = json.load(file)
+
+          locales = config["locales"]
+          successful_locales = summary["successfulLocales"]
+          changed_files = []
+
+          for locale in successful_locales:
+              for suffix in (".json", ".statsig.json"):
+                  source_path = os.path.join(tmp_dir, f"{locale}{suffix}")
+                  target_path = os.path.join(".original", f"{locale}{suffix}")
+                  with open(source_path, "rb") as source_file:
+                      source_bytes = source_file.read()
+                  target_bytes = None
+                  if os.path.exists(target_path):
+                      with open(target_path, "rb") as target_file:
+                          target_bytes = target_file.read()
+                  if target_bytes != source_bytes:
+                      changed_files.append(target_path)
+
+          summary["changedFiles"] = changed_files
+          summary["baseLocaleChanged"] = any(
+              path.startswith(os.path.join(".original", locales[0])) for path in changed_files
+          )
+
+          with open(compare_summary_path, "w", encoding="utf-8") as file:
+              json.dump(summary, file, ensure_ascii=False, indent=2)
+          PY
+
+          changed_count="$(python3 - "$compare_summary" <<'PY'
+          import json
+          import sys
+          with open(sys.argv[1], "r", encoding="utf-8") as file:
+              summary = json.load(file)
+          print(len(summary["changedFiles"]))
+          PY
+          )"
+
+          cached_locales_json="$(python3 - "$compare_summary" <<'PY'
+          import json
+          import sys
+          with open(sys.argv[1], "r", encoding="utf-8") as file:
+              summary = json.load(file)
+          print(json.dumps(summary["cachedLocales"], ensure_ascii=False))
+          PY
+          )"
+          successful_locales_json="$(python3 - "$compare_summary" <<'PY'
+          import json
+          import sys
+          with open(sys.argv[1], "r", encoding="utf-8") as file:
+              summary = json.load(file)
+          print(json.dumps(summary["successfulLocales"], ensure_ascii=False))
+          PY
+          )"
+          failed_locales_json="$(python3 - "$compare_summary" <<'PY'
+          import json
+          import sys
+          with open(sys.argv[1], "r", encoding="utf-8") as file:
+              summary = json.load(file)
+          print(json.dumps(summary["failedLocales"], ensure_ascii=False))
+          PY
+          )"
+          warnings_json="$(python3 - "$compare_summary" <<'PY'
+          import json
+          import sys
+          with open(sys.argv[1], "r", encoding="utf-8") as file:
+              summary = json.load(file)
+          print(json.dumps(summary["warnings"], ensure_ascii=False))
+          PY
+          )"
+          base_locale="$(python3 - "$compare_summary" <<'PY'
+          import json
+          import sys
+          with open(sys.argv[1], "r", encoding="utf-8") as file:
+              summary = json.load(file)
+          print(summary["baseLocale"])
+          PY
+          )"
+
+          if [ "$changed_count" -eq 0 ]; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "pending_created=false" >> "$GITHUB_OUTPUT"
+            echo "needs_translation=false" >> "$GITHUB_OUTPUT"
+            echo "base_locale=$base_locale" >> "$GITHUB_OUTPUT"
+            {
+              echo "cached_locales_json<<EOF"
+              echo "$cached_locales_json"
+              echo "EOF"
+              echo "successful_locales_json<<EOF"
+              echo "$successful_locales_json"
+              echo "EOF"
+              echo "failed_locales_json<<EOF"
+              echo "$failed_locales_json"
+              echo "EOF"
+              echo "warnings_json<<EOF"
+              echo "$warnings_json"
+              echo "EOF"
+              echo "diff_summary_json<<EOF"
+              echo "null"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
             echo "Upstream files match the repository copies."
             exit 0
           fi
 
-          cp "$tmp_dir/en-US.json" .original/en-US.json
-          cp "$tmp_dir/en-US.statsig.json" .original/en-US.statsig.json
+          base_changed="$(python3 - "$compare_summary" <<'PY'
+          import json
+          import sys
+          with open(sys.argv[1], "r", encoding="utf-8") as file:
+              summary = json.load(file)
+          print("true" if summary["baseLocaleChanged"] else "false")
+          PY
+          )"
+
+          pending_created="false"
+          needs_translation="false"
+          diff_summary_json="null"
+
+          if [ "$base_changed" = "true" ]; then
+            node scripts/original-locales/build_diff.mjs \
+              --config "$CONFIG_PATH" \
+              --before-dir .original \
+              --after-dir "$tmp_dir" \
+              --pending-dir "$PENDING_DIR" \
+              --metadata "$compare_summary" > "$diff_summary"
+
+            pending_created="true"
+            needs_translation="$(python3 - "$diff_summary" <<'PY'
+            import json
+            import sys
+            with open(sys.argv[1], "r", encoding="utf-8") as file:
+                summary = json.load(file)
+            print("true" if summary["needsTranslation"] else "false")
+            PY
+            )"
+            diff_summary_json="$(python3 - "$diff_summary" <<'PY'
+            import json
+            import sys
+            with open(sys.argv[1], "r", encoding="utf-8") as file:
+                summary = json.load(file)
+            print(json.dumps(summary, ensure_ascii=False))
+            PY
+            )"
+          fi
+
+          python3 - "$tmp_dir" "$compare_summary" <<'PY'
+          import json
+          import shutil
+          import sys
+          from pathlib import Path
+
+          tmp_dir, compare_summary_path = sys.argv[1:3]
+          with open(compare_summary_path, "r", encoding="utf-8") as file:
+              summary = json.load(file)
+
+          for target_path in summary["changedFiles"]:
+              name = Path(target_path).name
+              source_path = Path(tmp_dir) / name
+              shutil.copyfile(source_path, target_path)
+          PY
 
           echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "pending_created=$pending_created" >> "$GITHUB_OUTPUT"
+          echo "needs_translation=$needs_translation" >> "$GITHUB_OUTPUT"
+          echo "base_locale=$base_locale" >> "$GITHUB_OUTPUT"
           {
             echo "changed_files<<EOF"
-            git diff --name-only -- .original/en-US.json .original/en-US.statsig.json
+            python3 - "$compare_summary" <<'PY'
+            import json
+            import sys
+            with open(sys.argv[1], "r", encoding="utf-8") as file:
+                summary = json.load(file)
+            for path in summary["changedFiles"]:
+                print(path)
+            PY
+            echo "EOF"
+            echo "cached_locales_json<<EOF"
+            echo "$cached_locales_json"
+            echo "EOF"
+            echo "successful_locales_json<<EOF"
+            echo "$successful_locales_json"
+            echo "EOF"
+            echo "failed_locales_json<<EOF"
+            echo "$failed_locales_json"
+            echo "EOF"
+            echo "warnings_json<<EOF"
+            echo "$warnings_json"
+            echo "EOF"
+            echo "diff_summary_json<<EOF"
+            echo "$diff_summary_json"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
@@ -198,7 +459,10 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add .original/en-US.json .original/en-US.statsig.json
+          git add .original
+          if [ -d "$PENDING_DIR" ]; then
+            git add "$PENDING_DIR"
+          fi
           git commit -m "chore: update original Claude locale files"
           git push --set-upstream origin "$branch_name"
 
@@ -211,23 +475,85 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           BRANCH_NAME: ${{ steps.commit.outputs.branch_name }}
           CHANGED_FILES: ${{ steps.fetch.outputs.changed_files }}
+          CACHED_LOCALES_JSON: ${{ steps.fetch.outputs.cached_locales_json }}
+          SUCCESSFUL_LOCALES_JSON: ${{ steps.fetch.outputs.successful_locales_json }}
+          FAILED_LOCALES_JSON: ${{ steps.fetch.outputs.failed_locales_json }}
+          WARNINGS_JSON: ${{ steps.fetch.outputs.warnings_json }}
+          DIFF_SUMMARY_JSON: ${{ steps.fetch.outputs.diff_summary_json }}
+          NEEDS_TRANSLATION: ${{ steps.fetch.outputs.needs_translation }}
+          PENDING_CREATED: ${{ steps.fetch.outputs.pending_created }}
+          BASE_LOCALE: ${{ steps.fetch.outputs.base_locale }}
         shell: bash
         run: |
           set -euo pipefail
 
           body_file="$(mktemp)"
-          {
-            echo "Automated update for upstream Claude locale source files."
-            echo
-            echo "Sources:"
-            echo "- $MAIN_SOURCE_URL"
-            echo "- $STATSIG_SOURCE_URL"
-            echo
-            echo "Changed files:"
-            while IFS= read -r file; do
-              [ -n "$file" ] && echo "- \`$file\`"
-            done <<< "$CHANGED_FILES"
-          } > "$body_file"
+          python3 - "$body_file" <<'PY'
+          import json
+          import os
+          import sys
+
+          body_path = sys.argv[1]
+          changed_files = [line for line in os.environ["CHANGED_FILES"].splitlines() if line]
+          cached_locales = json.loads(os.environ["CACHED_LOCALES_JSON"])
+          successful_locales = json.loads(os.environ["SUCCESSFUL_LOCALES_JSON"])
+          failed_locales = json.loads(os.environ["FAILED_LOCALES_JSON"])
+          warnings = json.loads(os.environ["WARNINGS_JSON"])
+          diff_summary = json.loads(os.environ["DIFF_SUMMARY_JSON"]) if os.environ["DIFF_SUMMARY_JSON"] != "null" else None
+          pending_created = os.environ["PENDING_CREATED"] == "true"
+          needs_translation = os.environ["NEEDS_TRANSLATION"] == "true"
+          base_locale = os.environ["BASE_LOCALE"]
+
+          lines = [
+              "Automated update for upstream Claude locale source files.",
+              "",
+              "Source patterns:",
+              "- `https://claude.ai/i18n/{locale}.json`",
+              "- `https://claude.ai/i18n/statsig/{locale}.json`",
+              "",
+              f"Cached upstream locales: `{', '.join(cached_locales)}`",
+              f"Base locale for diff generation: `{base_locale}`",
+              "",
+              "Fetch status:",
+              f"- Successful locales: `{', '.join(successful_locales) if successful_locales else 'none'}`",
+              f"- Failed locales: `{', '.join(failed_locales) if failed_locales else 'none'}`",
+              "",
+              "Changed files:",
+          ]
+
+          if changed_files:
+              lines.extend([f"- `{path}`" for path in changed_files])
+          else:
+              lines.append("- none")
+
+          lines.extend(["", "Warnings:"])
+          if warnings:
+              lines.extend([f"- {warning}" for warning in warnings])
+          else:
+              lines.append("- none")
+
+          lines.extend(["", "Base locale diff summary:"])
+          if diff_summary:
+              for file_label in ("main", "statsig"):
+                  summary = diff_summary["diffSummary"][file_label]
+                  lines.append(
+                      f"- `{file_label}`: add {summary['add']}, update {summary['update']}, remove {summary['remove']}, total {summary['total']}"
+                  )
+          else:
+              lines.append("- No base locale diff generated; only reference cache files changed.")
+
+          lines.extend(
+              [
+                  "",
+                  "Translation status:",
+                  f"- Pending diff artifacts created: `{'yes' if pending_created else 'no'}`",
+                  f"- Manual translation required: `{'yes' if needs_translation else 'no'}`",
+              ]
+          )
+
+          with open(body_path, "w", encoding="utf-8") as file:
+              file.write("\n".join(lines) + "\n")
+          PY
 
           pr_url="$(gh pr create \
             --base "$GITHUB_REF_NAME" \
