@@ -18,6 +18,10 @@ env:
   BRANCH_PREFIX: bot/update-original-locales-
   MAIN_SOURCE_URL: https://claude.ai/i18n/en-US.json
   STATSIG_SOURCE_URL: https://claude.ai/i18n/statsig/en-US.json
+  FETCH_MAX_ATTEMPTS: "5"
+  FETCH_INITIAL_BACKOFF_SECONDS: "5"
+  FETCH_BACKOFF_MULTIPLIER: "2"
+  FETCH_JITTER_SECONDS: "1"
 
 jobs:
   update:
@@ -48,9 +52,20 @@ jobs:
           tmp_dir="$(mktemp -d)"
           trap 'rm -rf "$tmp_dir"' EXIT
 
-          python3 - "$MAIN_SOURCE_URL" "$tmp_dir/en-US.json" "$STATSIG_SOURCE_URL" "$tmp_dir/en-US.statsig.json" <<'PY'
+          if python3 - "$MAIN_SOURCE_URL" "$tmp_dir/en-US.json" "$STATSIG_SOURCE_URL" "$tmp_dir/en-US.statsig.json" <<'PY'
           import sys
+          import os
+          import random
+          import time
           from curl_cffi import requests
+
+          RETRYABLE_STATUS_CODES = {403, 429, 500, 502, 503, 504}
+          BLOCKING_STATUS_CODES = {403, 429}
+          MAX_ATTEMPTS = int(os.environ.get("FETCH_MAX_ATTEMPTS", "5"))
+          INITIAL_BACKOFF_SECONDS = float(os.environ.get("FETCH_INITIAL_BACKOFF_SECONDS", "5"))
+          BACKOFF_MULTIPLIER = float(os.environ.get("FETCH_BACKOFF_MULTIPLIER", "2"))
+          JITTER_SECONDS = float(os.environ.get("FETCH_JITTER_SECONDS", "1"))
+          SKIP_EXIT_CODE = 42
 
           headers = {
               "accept": "application/json,text/plain,*/*",
@@ -63,22 +78,95 @@ jobs:
               (sys.argv[3], sys.argv[4]),
           ]
 
+          def backoff_seconds(attempt):
+              base = INITIAL_BACKOFF_SECONDS * (BACKOFF_MULTIPLIER ** max(attempt - 1, 0))
+              return base + random.uniform(0, JITTER_SECONDS)
+
+          def body_preview(response):
+              try:
+                  text = response.text.strip()
+              except Exception:
+                  return ""
+
+              text = " ".join(text.split())
+              return text[:300]
+
           for url, output in sources:
-              response = requests.get(
-                  url,
-                  headers=headers,
-                  impersonate="chrome",
-                  timeout=60,
-              )
-              response.raise_for_status()
+              last_response = None
+              last_error = None
 
-              content = response.content
-              if not content.lstrip().startswith((b"{", b"[")):
-                  raise SystemExit(f"Fetched response from {url} does not look like JSON.")
+              for attempt in range(1, MAX_ATTEMPTS + 1):
+                  try:
+                      response = requests.get(
+                          url,
+                          headers=headers,
+                          impersonate="chrome",
+                          timeout=60,
+                      )
+                      last_response = response
 
-              with open(output, "wb") as file:
-                  file.write(content)
+                      if response.status_code < 400:
+                          content = response.content
+                          if not content.lstrip().startswith((b"{", b"[")):
+                              raise SystemExit(f"Fetched response from {url} does not look like JSON.")
+
+                          with open(output, "wb") as file:
+                              file.write(content)
+                          break
+
+                      if response.status_code in RETRYABLE_STATUS_CODES and attempt < MAX_ATTEMPTS:
+                          delay = backoff_seconds(attempt)
+                          print(
+                              f"[retry] {url} returned HTTP {response.status_code} on attempt "
+                              f"{attempt}/{MAX_ATTEMPTS}; sleeping {delay:.1f}s before retry."
+                          )
+                          time.sleep(delay)
+                          continue
+
+                      if response.status_code in BLOCKING_STATUS_CODES:
+                          preview = body_preview(response)
+                          print(
+                              f"::warning::Skipping upstream locale refresh because {url} still returned "
+                              f"HTTP {response.status_code} after {MAX_ATTEMPTS} attempts."
+                          )
+                          if preview:
+                              print(f"::warning::Response preview: {preview}")
+                          raise SystemExit(SKIP_EXIT_CODE)
+
+                      response.raise_for_status()
+                  except SystemExit:
+                      raise
+                  except Exception as error:
+                      last_error = error
+                      if attempt < MAX_ATTEMPTS:
+                          delay = backoff_seconds(attempt)
+                          print(
+                              f"[retry] {url} failed on attempt {attempt}/{MAX_ATTEMPTS}: {error}. "
+                              f"Sleeping {delay:.1f}s before retry."
+                          )
+                          time.sleep(delay)
+                          continue
+                      raise
+
+              else:
+                  if last_response is not None:
+                      last_response.raise_for_status()
+                  if last_error is not None:
+                      raise last_error
+                  raise SystemExit(f"Failed to fetch {url} for an unknown reason.")
           PY
+          then
+            :
+          else
+            status="$?"
+            if [ "$status" -eq 42 ]; then
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+              echo "skipped_due_to_upstream_block=true" >> "$GITHUB_OUTPUT"
+              echo "Upstream blocked automated fetches after retries; skipping this run."
+              exit 0
+            fi
+            exit "$status"
+          fi
 
           if cmp --silent "$tmp_dir/en-US.json" .original/en-US.json \
             && cmp --silent "$tmp_dir/en-US.statsig.json" .original/en-US.statsig.json; then
